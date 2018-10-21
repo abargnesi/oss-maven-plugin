@@ -1,18 +1,18 @@
 package com.github.maven.plugin.oss;
 
 import static com.github.maven.plugin.oss.Utility.dependencyToCoordinate;
-import static java.lang.String.format;
+import static com.github.maven.plugin.oss.Utility.retrieveFullyQualifiedClasses;
 import static java.util.Arrays.asList;
+import static java.util.stream.Collectors.toMap;
 import static java.util.stream.Collectors.toSet;
 
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.expr.Name;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.maven.artifact.Artifact;
 import org.apache.maven.execution.MavenSession;
-import org.apache.maven.model.IssueManagement;
-import org.apache.maven.model.Model;
-import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.logging.Log;
 import org.apache.maven.plugins.annotations.Component;
@@ -26,8 +26,8 @@ import org.apache.maven.shared.artifact.resolve.ArtifactResult;
 
 import java.io.File;
 import java.io.FileNotFoundException;
-import java.io.FileReader;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 @Mojo(
@@ -52,7 +52,7 @@ public class ReportIssuesMojo extends AbstractMojo {
     private ArtifactResolver artifactResolver;
 
     public void execute() {
-        // TODO Create mapping of [FQC name] to [Artifact]
+        // TODO ✔ Create mapping of [FQC name] to [Artifact]
         // TODO Compute artifact counters for used imports.
         // TODO Infer issue management system and URL (check issueManagement, infer from SCM, infer from URL).
         // TODO Crawl issues using
@@ -83,35 +83,24 @@ public class ReportIssuesMojo extends AbstractMojo {
 
         imports.forEach(i -> log.info("Source import → " + i));
 
-        project.getDependencies().stream()
+        final Map<String, Artifact> fqcToArtifact = project.getDependencies().stream()
             .filter(dep -> DEFAULT_SCOPES.contains(dep.getScope()))
-            .forEach(dep -> {
-                log.info("Scanning dependency → " + dep);
+            .flatMap(dep -> {
                 final ProjectBuildingRequest buildingRequest =
                     new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
                 buildingRequest.setRemoteRepositories(project.getRemoteArtifactRepositories());
                 try {
                     final ArtifactResult result = artifactResolver.resolveArtifact(buildingRequest, dependencyToCoordinate(dep));
-                    log.info("  Resolved to → " + result.getArtifact().getFile().getAbsolutePath());
-
-                    final String pomPath = result.getArtifact().getFile().getAbsolutePath().replaceFirst(".jar$", ".pom");
-
-                    final MavenXpp3Reader reader = new MavenXpp3Reader();
-                    final Model model = reader.read(new FileReader(pomPath));
-
-                    final IssueManagement issues = model.getIssueManagement();
-                    if (issues != null) {
-                        log.info(format("Found issue tracker %s at %s", issues.getSystem(), issues.getUrl()));
-                    } else {
-                        if (model.getScm() != null) {
-                            log.info(format("Found SCM at %s", model.getScm().getUrl()));
-                        } else {
-                            log.info(format("Found URL at %s", model.getUrl()));
-                        }
-                    }
+                    final Artifact artifact = result.getArtifact();
+                    return retrieveFullyQualifiedClasses(artifact)
+                        .stream()
+                        .map(fqc -> Pair.of(fqc, artifact));
                 } catch (Exception e) {
-                    System.out.println("Error resolving artifact: " + e.getMessage());
+                    throw new RuntimeException("Error resolving artifact: " + e.getMessage(), e);
                 }
-            });
+            })
+            .collect(toMap(Pair::getKey, Pair::getValue, (art1, art2) -> art1));
+
+        System.out.println(fqcToArtifact);
     }
 }
