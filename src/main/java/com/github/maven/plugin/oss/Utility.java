@@ -97,6 +97,54 @@ final class Utility {
         return counts;
     }
 
+    static Map<Artifact, Long> computeDependencyUsage(
+        final MavenProject topProject, final List<MavenProject> projects,
+        final MavenSession session, final ArtifactResolver resolver) {
+
+        final List<MavenProject> jarProjects = projects
+            .stream()
+            .filter(project -> "jar".equalsIgnoreCase(project.getPackaging()))
+            .collect(toList());
+
+        final List<String> fqcImported =
+            jarProjects
+            .stream()
+            .filter(project -> !topProject.equals(project))
+            .flatMap(project -> Utility.retrieveImportedClasses(project).stream())
+            .collect(toList());
+
+        final Map<String, Artifact> fqcDependency =
+            jarProjects
+            .stream()
+            .flatMap(project -> project.getDependencies().stream().map(dep -> Pair.of(project, dep)))
+            .filter(dep -> !"system".equalsIgnoreCase(dep.getRight().getScope()))
+            .flatMap(dep -> {
+                final ProjectBuildingRequest buildingRequest =
+                    new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
+                buildingRequest.setRemoteRepositories(dep.getLeft().getRemoteArtifactRepositories());
+                try {
+                    final ArtifactResult result = resolver.resolveArtifact(buildingRequest, dependencyToCoordinate(dep.getRight()));
+                    final Artifact artifact = result.getArtifact();
+                    return retrieveFullyQualifiedClasses(artifact)
+                        .stream()
+                        .map(fqc -> Pair.of(fqc, artifact));
+                } catch (Exception e) {
+                    throw new RuntimeException("Error resolving artifact: " + e.getMessage(), e);
+                }
+            })
+            .collect(toMap(Pair::getKey, Pair::getValue, (art1, art2) -> art1));
+
+        final Map<Artifact, Long> counts = new HashMap<>(fqcDependency.values().size());
+        fqcImported.forEach(fqcImport -> {
+            final Artifact match = fqcDependency.get(fqcImport);
+            if (match != null) {
+                counts.merge(match, 1L, Long::sum);
+            }
+        });
+
+        return counts;
+    }
+
     static File resolvePomFile(final Artifact artifact) {
         return new File(artifact.getFile().getAbsolutePath().replaceFirst(".jar$", ".pom"));
     }
