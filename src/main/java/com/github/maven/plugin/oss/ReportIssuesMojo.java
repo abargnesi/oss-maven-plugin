@@ -1,16 +1,11 @@
 package com.github.maven.plugin.oss;
 
-import static com.github.maven.plugin.oss.Utility.dependencyToCoordinate;
-import static com.github.maven.plugin.oss.Utility.retrieveFullyQualifiedClasses;
-import static java.util.Arrays.asList;
+import static java.util.Collections.reverseOrder;
+import static java.util.Map.Entry.comparingByValue;
+import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
-import static java.util.stream.Collectors.toSet;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.ImportDeclaration;
-import com.github.javaparser.ast.expr.Name;
-import org.apache.commons.lang3.tuple.Pair;
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
@@ -18,24 +13,19 @@ import org.apache.maven.plugin.logging.Log;
 import org.apache.maven.plugins.annotations.Component;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.project.DefaultProjectBuildingRequest;
 import org.apache.maven.project.MavenProject;
-import org.apache.maven.project.ProjectBuildingRequest;
 import org.apache.maven.shared.artifact.resolve.ArtifactResolver;
-import org.apache.maven.shared.artifact.resolve.ArtifactResult;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.util.HashSet;
+import java.util.Collection;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.Map.Entry;
 
 @Mojo(
     name = "report-issues",
+    aggregator = true,
     requiresDirectInvocation = true)
 public class ReportIssuesMojo extends AbstractMojo {
-
-    private static Set<String> DEFAULT_SCOPES = new HashSet<>(asList("compile", "runtime"));
 
     @Parameter(
         defaultValue = "${session}",
@@ -48,59 +38,71 @@ public class ReportIssuesMojo extends AbstractMojo {
         readonly = true)
     private MavenProject project;
 
+    @Parameter(
+        defaultValue = "${reactorProjects}",
+        readonly = true,
+        required = true)
+    private List<MavenProject> reactorProjects;
+
     @Component
     private ArtifactResolver artifactResolver;
 
     public void execute() {
         // TODO ✔ Create mapping of [FQC name] to [Artifact]
-        // TODO Compute artifact counters for used imports.
+        // TODO ✔ Compute artifact counters for used imports.
+        // TODO Determine transitive dependencies, per project, so more imports match.
         // TODO Infer issue management system and URL (check issueManagement, infer from SCM, infer from URL).
-        // TODO Crawl issues using
+        // TODO Crawl issues using http-client and jsoup.
 
-        final Log log = getLog();
+        if (CollectionUtils.isNotEmpty(reactorProjects)) {
+            reactorReport(reactorProjects, project, session, artifactResolver, getLog());
+        } else {
+            projectReport(session.getCurrentProject(), session, artifactResolver, getLog());
+        }
+    }
 
-        final MavenProject project = session.getCurrentProject();
+    private static void reactorReport(
+        final List<MavenProject> moduleProjects, final MavenProject topProject,
+        final MavenSession session, final ArtifactResolver artifactResolver, final Log log) {
 
-        final Set<File> sourceFiles = project.getCompileSourceRoots()
+        log.info("Analyzing multi-module build for: " + topProject.getName());
+        final List<Entry<Artifact, Long>> orderedDependencyUsage =
+            moduleProjects
             .stream()
-            .flatMap(Utility::recursivelyScanForFilesInDirectory)
-            .collect(toSet());
-
-        final Set<String> imports = sourceFiles
+            .filter(moduleProject -> !moduleProject.equals(topProject))
+            .filter(moduleProject -> "jar".equalsIgnoreCase(moduleProject.getPackaging()))
+            .map(project -> Utility.computeDependencyUsage(project, session, artifactResolver))
+            .map(Map::entrySet)
+            .flatMap(Collection::stream)
+            .collect(toMap(Entry::getKey, Entry::getValue, Long::sum))
+            .entrySet()
             .stream()
-            .flatMap(file -> {
-                try {
-                    final CompilationUnit cUnit = JavaParser.parse(file);
-                    return cUnit.getImports()
-                        .stream()
-                        .filter(impDecl -> !impDecl.isAsterisk() && !impDecl.isStatic())
-                        .map(ImportDeclaration::getName).map(Name::asString);
-                } catch (FileNotFoundException e) {
-                    throw new RuntimeException("error parsing " + file.getAbsolutePath(), e);
-                }
-            })
-            .collect(toSet());
+            .sorted(reverseOrder(comparingByValue()))
+            .collect(toList());
 
-        imports.forEach(i -> log.info("Source import → " + i));
+        orderedDependencyUsage.forEach(du -> {
+            final Artifact art = du.getKey();
+            log.info("Dependency → " + art.getGroupId() + ":" + art.getArtifactId() + ":" + art.getVersion());
+            log.info("  Import count: " + du.getValue());
+        });
+    }
 
-        final Map<String, Artifact> fqcToArtifact = project.getDependencies().stream()
-            .filter(dep -> DEFAULT_SCOPES.contains(dep.getScope()))
-            .flatMap(dep -> {
-                final ProjectBuildingRequest buildingRequest =
-                    new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
-                buildingRequest.setRemoteRepositories(project.getRemoteArtifactRepositories());
-                try {
-                    final ArtifactResult result = artifactResolver.resolveArtifact(buildingRequest, dependencyToCoordinate(dep));
-                    final Artifact artifact = result.getArtifact();
-                    return retrieveFullyQualifiedClasses(artifact)
-                        .stream()
-                        .map(fqc -> Pair.of(fqc, artifact));
-                } catch (Exception e) {
-                    throw new RuntimeException("Error resolving artifact: " + e.getMessage(), e);
-                }
-            })
-            .collect(toMap(Pair::getKey, Pair::getValue, (art1, art2) -> art1));
+    private static void projectReport(
+        final MavenProject project, final MavenSession session,
+        final ArtifactResolver artifactResolver, final Log log) {
 
-        System.out.println(fqcToArtifact);
+        log.info("Analyzing project: " + project.getName());
+        final Map<Artifact, Long> dependencyUsage = Utility.computeDependencyUsage(project, session, artifactResolver);
+
+        final List<Entry<Artifact, Long>> orderedDependencyUsage = dependencyUsage.entrySet()
+            .stream()
+            .sorted(reverseOrder(comparingByValue()))
+            .collect(toList());
+
+        orderedDependencyUsage.forEach(du -> {
+            final Artifact art = du.getKey();
+            log.info("Dependency → " + art.getGroupId() + ":" + art.getArtifactId() + ":" + art.getVersion());
+            log.info("  Import count: " + du.getValue());
+        });
     }
 }
