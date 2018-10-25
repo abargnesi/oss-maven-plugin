@@ -1,6 +1,8 @@
 package com.github.maven.plugin.oss;
 
+import static java.lang.String.format;
 import static java.util.Collections.emptyList;
+import static java.util.regex.Pattern.compile;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 import static java.util.stream.Collectors.toSet;
@@ -9,12 +11,16 @@ import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.expr.Name;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.commons.lang3.tuple.Triple;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Dependency;
 import org.apache.maven.model.IssueManagement;
 import org.apache.maven.model.Model;
+import org.apache.maven.model.Parent;
+import org.apache.maven.model.Scm;
 import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
 import org.apache.maven.project.DefaultProjectBuildingRequest;
 import org.apache.maven.project.MavenProject;
@@ -22,18 +28,22 @@ import org.apache.maven.project.ProjectBuildingRequest;
 import org.apache.maven.shared.artifact.ArtifactCoordinate;
 import org.apache.maven.shared.artifact.DefaultArtifactCoordinate;
 import org.apache.maven.shared.artifact.resolve.ArtifactResolver;
+import org.apache.maven.shared.artifact.resolve.ArtifactResolverException;
 import org.apache.maven.shared.artifact.resolve.ArtifactResult;
 import org.codehaus.plexus.util.DirectoryScanner;
+import org.codehaus.plexus.util.xml.pull.XmlPullParserException;
 
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.jar.JarFile;
+import java.util.regex.Matcher;
 import java.util.stream.Stream;
 
 final class Utility {
@@ -97,7 +107,7 @@ final class Utility {
         return counts;
     }
 
-    static Map<Artifact, Long> computeDependencyUsage(
+    static Map<Pair<Artifact, MavenProject>, Long> computeDependencyUsage(
         final MavenProject topProject, final List<MavenProject> projects,
         final MavenSession session, final ArtifactResolver resolver) {
 
@@ -113,7 +123,7 @@ final class Utility {
             .flatMap(project -> Utility.retrieveImportedClasses(project).stream())
             .collect(toList());
 
-        final Map<String, Artifact> fqcDependency =
+        final Map<String, Pair<Artifact, MavenProject>> fqcDependency =
             jarProjects
             .stream()
             .flatMap(project -> project.getDependencies().stream().map(dep -> Pair.of(project, dep)))
@@ -127,16 +137,16 @@ final class Utility {
                     final Artifact artifact = result.getArtifact();
                     return retrieveFullyQualifiedClasses(artifact)
                         .stream()
-                        .map(fqc -> Pair.of(fqc, artifact));
+                        .map(fqc -> Triple.of(fqc, artifact, dep.getKey()));
                 } catch (Exception e) {
                     throw new RuntimeException("Error resolving artifact: " + e.getMessage(), e);
                 }
             })
-            .collect(toMap(Pair::getKey, Pair::getValue, (art1, art2) -> art1));
+            .collect(toMap(Triple::getLeft, t -> Pair.of(t.getMiddle(), t.getRight()), (art1, art2) -> art1));
 
-        final Map<Artifact, Long> counts = new HashMap<>(fqcDependency.values().size());
+        final Map<Pair<Artifact, MavenProject>, Long> counts = new HashMap<>(fqcDependency.values().size());
         fqcImported.forEach(fqcImport -> {
-            final Artifact match = fqcDependency.get(fqcImport);
+            final Pair<Artifact, MavenProject> match = fqcDependency.get(fqcImport);
             if (match != null) {
                 counts.merge(match, 1L, Long::sum);
             }
@@ -145,26 +155,114 @@ final class Utility {
         return counts;
     }
 
-    static File resolvePomFile(final Artifact artifact) {
-        return new File(artifact.getFile().getAbsolutePath().replaceFirst(".jar$", ".pom"));
+    static List<Model> resolvePOMLineage(
+        final Artifact artifact,  final ArtifactResolver artifactResolver,
+        final MavenProject project, final MavenSession session)
+        throws IOException, XmlPullParserException, ArtifactResolverException {
+
+        final File basePOM = new File(artifact.getFile().getAbsolutePath().replaceFirst(".jar$", ".pom"));
+
+        final MavenXpp3Reader reader = new MavenXpp3Reader();
+        Model model = reader.read(new FileReader(basePOM));
+
+        Parent pomParent = model.getParent();
+
+
+        final List<Model> pomLineage = new ArrayList<>();
+        pomLineage.add(model);
+        while (pomParent != null) {
+            // resolve parent POM
+            final ProjectBuildingRequest buildingRequest = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
+            buildingRequest.setRemoteRepositories(project.getRemoteArtifactRepositories());
+
+            DefaultArtifactCoordinate parentCoordinate = new DefaultArtifactCoordinate();
+            parentCoordinate.setGroupId(pomParent.getGroupId());
+            parentCoordinate.setArtifactId(pomParent.getArtifactId());
+            parentCoordinate.setVersion(pomParent.getVersion());
+            parentCoordinate.setExtension("pom");
+
+            ArtifactResult parentPOMResult = artifactResolver.resolveArtifact(buildingRequest, parentCoordinate);
+
+            // read POM model
+            File parentPOMFile = parentPOMResult.getArtifact().getFile();
+            Model pomModel = reader.read(new FileReader(parentPOMFile));
+
+            pomLineage.add(pomModel);
+            pomParent = pomModel.getParent();
+        }
+
+        return pomLineage;
     }
 
-    static Pair<String, String> resolveIssueSite(final File pomFile) throws Exception {
-        final MavenXpp3Reader reader = new MavenXpp3Reader();
-        final Model model = reader.read(new FileReader(pomFile));
+    static String normalizeIssueSystem(final String text) {
+        if (StringUtils.isEmpty(text)) {
+            return null;
+        }
 
-        final IssueManagement issues = model.getIssueManagement();
-        if (issues != null) {
-            return Pair.of(issues.getSystem(), issues.getUrl());
+        final String nameLower = text.toLowerCase();
+        if (nameLower.contains("github")) {
+            return "github";
+        } else if (nameLower.contains("jira")) {
+            return "jira";
+        } else if (nameLower.contains("sourceforge")) {
+            return "sourceforge";
+        } else if (nameLower.contains("google") && nameLower.contains("code")) {
+            return "google code";
+        } else if (nameLower.contains("youtrack")) {
+            return "youtrack";
+        } else if (nameLower.contains("bugzilla")) {
+            return "bugzilla";
         } else {
-            if (model.getScm() != null) {
-                // TODO Check scm url for GitHub or BitBucket; convert URL appropriately.
-                return Pair.of("TODO", model.getScm().getUrl());
-            } else {
-                // TODO Check main url for GitHub or BitBucket; convert URL appropriately.
-                return Pair.of("TODO", model.getUrl());
+            throw new UnsupportedOperationException("do not know " + text);
+        }
+    }
+
+    static Pair<String, String> resolveIssueSite(final List<Model> pomLineage) {
+        // prefer issue management
+        for (final Model pom : pomLineage) {
+            final IssueManagement issues = pom.getIssueManagement();
+            if (issues != null) {
+                String issuesURL = issues.getUrl();
+                issuesURL = issuesURL.replace("${project.artifactId}", pom.getArtifactId());
+
+                String normalizedIssuesSystem = normalizeIssueSystem(issues.getSystem());
+                if (normalizedIssuesSystem == null) {
+                    normalizedIssuesSystem = normalizeIssueSystem(issuesURL);
+                }
+
+                return Pair.of(normalizedIssuesSystem, issuesURL);
             }
         }
+
+        // infer from github scm
+        for (final Model pom : pomLineage) {
+            final Scm scm = pom.getScm();
+            if (scm != null && scm.getUrl() != null) {
+                Matcher ghMatch = compile("github\\.com/(?<org>[^/]+)/(?<repo>[a-zA-Z0-9_\\-.]+)").matcher(scm.getUrl());
+                if (ghMatch.find()) {
+                    return Pair.of("github",
+                        format("https://github.com/%s/%s/issues", ghMatch.group("org"), ghMatch.group("repo")));
+                }
+
+                ghMatch = compile("git@github\\.com:(?<org>[^/]+)/(?<repo>[a-zA-Z0-9_\\-.]+)").matcher(scm.getUrl());
+                if (ghMatch.find()) {
+                    return Pair.of("github",
+                        format("https://github.com/%s/%s/issues", ghMatch.group("org"), ghMatch.group("repo")));
+                }
+            }
+        }
+
+        // infer from github url
+        for (final Model pom : pomLineage) {
+            if (pom.getUrl() != null) {
+                final Matcher ghMatch = compile(".*github\\.com/(?<org>[^/]+)/(?<repo>[a-zA-Z0-9_\\-.]+).*").matcher(pom.getUrl());
+                if (ghMatch.matches()) {
+                    return Pair.of("github",
+                        format("https://github.com/%s/%s/issues", ghMatch.group("org"), ghMatch.group("repo")));
+                }
+            }
+        }
+        return null;
     }
 
     private static Stream<File> recursivelyScanForFilesInDirectory(final String baseDir) {
