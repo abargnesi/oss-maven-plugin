@@ -160,6 +160,8 @@ public class ReportIssuesMojo extends AbstractMojo {
         switch(issueSystem) {
             case "github":
                 return new GitHubIssueScraper();
+            case "jira":
+                return new JiraIssueScraper();
             default:
                 return new NoOpIssueScraper(issueSystem);
         }
